@@ -27,6 +27,7 @@ func main() {
 		VerifyServerCertificate: false,
 		Username:                user,
 		Password:                pass,
+		RemoveOutLinks:          false,
 	}
 	c, err := nifitest.New(&cfg)
 	if err != nil {
@@ -34,14 +35,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	testData := make(map[nifitest.Id]string)
-	src := nifitest.NewId("e2a26c9b-0184-1000-40ef-d2edcb8e63e2",
-		"e447fb30-0184-1000-15b5-2adea499753e")
+	testData := make(map[string]string)
+	src := "e447fb30-0184-1000-15b5-2adea499753e"
 	testData[src] = "123"
-	expected := make(map[nifitest.Id]string)
-	dst := nifitest.NewId("e2a26c9b-0184-1000-40ef-d2edcb8e63e2",
-		"322b9410-0185-1000-fdc6-192740b4fd9c")
-	expected[dst] = "123"
+	exp := []byte{0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 0xff, 0x33, 0x34, 0x32,
+		6, 0, 0xd2, 0x63, 0x48, 0x88, 3, 0, 0, 0}
+	expected := make(map[string]string)
+	dst := "322b9410-0185-1000-fdc6-192740b4fd9c"
+	expected[dst] = string(exp)
 	err = c.Run("root", testData, expected)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)

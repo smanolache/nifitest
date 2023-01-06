@@ -24,9 +24,10 @@ import (
 )
 
 type testerImpl struct {
-	log    *zap.Logger
-	ctx    context.Context
-	client *nifi.APIClient
+	log            *zap.Logger
+	ctx            context.Context
+	client         *nifi.APIClient
+	removeOutLinks bool
 }
 
 func New(cfg *Config) (Tester, error) {
@@ -45,14 +46,15 @@ func New(cfg *Config) (Tester, error) {
 	// }
 	// ctx = context.WithValue(ctx, nifi.ContextAccessToken, token)
 	return &testerImpl{
-		log:    log,
-		ctx:    ctx,
-		client: clnt,
+		log:            log,
+		ctx:            ctx,
+		client:         clnt,
+		removeOutLinks: cfg.RemoveOutLinks,
 	}, nil
 }
 
 func (t *testerImpl) Run(flowId string,
-	testData, expected map[Id]string) error {
+	testData, expected map[string]string) error {
 
 	// get the proc
 	pgfe, h, body, err := t.client.FlowApi.GetFlow(
@@ -67,27 +69,24 @@ func (t *testerImpl) Run(flowId string,
 	}
 
 	conns, h, body, err := t.client.ProcessGroupsApi.GetConnections(
-		t.ctx,
-		pgfe.ProcessGroupFlow.Id)
+		t.ctx, pgfe.ProcessGroupFlow.Id)
 	err = t.handleErr(err, h, body, 200, "GetConnections")
 	if err != nil {
 		return err
 	}
 
-	injectors := make(map[Id]*nifi.ProcessorEntity)
-	srcAdd := make(map[Id][]*nifi.ConnectionEntity)
-	srcDel := make(map[Id][]*nifi.ConnectionEntity)
-	ports := make(map[Id]*nifi.PortEntity)
-	sinkAdd := make(map[Id][]*nifi.ConnectionEntity)
-	sinkDel := make(map[Id][]*nifi.ConnectionEntity)
+	injectors := make(map[string]*nifi.ProcessorEntity)
+	srcAdd := make(map[string][]*nifi.ConnectionEntity)
+	ports := make(map[string]*nifi.PortEntity)
+	sinkAdd := make(map[string][]*nifi.ConnectionEntity)
+	sinkDel := make(map[string][]*nifi.ConnectionEntity)
 
 	for id, toInject := range testData {
 		outgoing := connsOutOfId(id, conns.Connections)
 		// creates an injector
-		// deletes all outgoing connections from id
-		// creates connections from the injector to the destinations
-		// of the former outgoing connections of id6
-		injector, addConns, delConns, err :=
+		// creates connections from the injector to the destinations of
+		// the former outgoing connections of id
+		injector, addConns, err :=
 			t.createInjector(&pgfe, outgoing, id, toInject)
 		if injector != nil {
 			injectors[id] = injector
@@ -95,11 +94,8 @@ func (t *testerImpl) Run(flowId string,
 		if addConns != nil {
 			srcAdd[id] = addConns
 		}
-		if delConns != nil {
-			srcDel[id] = delConns
-		}
 		if err != nil {
-			return t.rollback(&pgfe, injectors, srcAdd, srcDel,
+			return t.rollback(&pgfe, injectors, srcAdd,
 				ports, sinkAdd, sinkDel, err)
 		}
 	}
@@ -111,7 +107,7 @@ func (t *testerImpl) Run(flowId string,
 		// creates connections from the sources of the former incoming,
 		// connections to the sink
 		port, addConns, delConns, err :=
-			t.createSink(&pgfe, incoming, id)
+			t.createPort(&pgfe, incoming, id)
 		if port != nil {
 			ports[id] = port
 		}
@@ -122,7 +118,7 @@ func (t *testerImpl) Run(flowId string,
 			sinkDel[id] = delConns
 		}
 		if err != nil {
-			return t.rollback(&pgfe, injectors, srcAdd, srcDel,
+			return t.rollback(&pgfe, injectors, srcAdd,
 				ports, sinkAdd, sinkDel, err)
 		}
 	}
@@ -132,52 +128,49 @@ func (t *testerImpl) Run(flowId string,
 
 	excluded := make(map[string]interface{})
 	excludeNodes(excluded, injectors)
-	excludePorts(excluded, ports)
+	if t.removeOutLinks {
+		excludePorts(excluded, ports)
+	}
 	/*started*/_, err = t.startFlow(&pgfe, injectors, ports, excluded)
 	if err != nil {
-		return t.rollback(&pgfe, injectors, srcAdd, srcDel, ports,
-			sinkAdd, sinkDel, err)
+		return t.rollback(&pgfe, injectors, srcAdd, ports, sinkAdd,
+			sinkDel, err)
 	}
 
-	// reader.ReadString('\n')
+	reader.ReadString('\n')
 
 	results, err := t.getResults(ports)
 	if err != nil {
-		return t.rollback(&pgfe, injectors, srcAdd, srcDel, ports,
-			sinkAdd, sinkDel, err)
+		return t.rollback(&pgfe, injectors, srcAdd, ports, sinkAdd,
+			sinkDel, err)
 	}
 	for id, r := range expected {
 		actual, found := results[id]
 		if !found || actual != r {
-			t.log.Error("Output " + id.Id() + ": expected: " + r +
+			t.log.Error("Output " + id + ": expected: " + r +
 				", got: " + actual)
 		}
 	}
 
-	return t.rollback(&pgfe, injectors, srcAdd, srcDel, ports, sinkAdd,
-		sinkDel, err)
+	return t.rollback(&pgfe, injectors, srcAdd, ports, sinkAdd, sinkDel,
+		err)
 }
 
 func (t *testerImpl) createInjector(pgfe *nifi.ProcessGroupFlowEntity,
-	out []*nifi.ConnectionEntity, id Id, toInject string) (
+	out []*nifi.ConnectionEntity, id, toInject string) (
 	injector *nifi.ProcessorEntity,
-	connected, disconnected []*nifi.ConnectionEntity, err error) {
+	connected []*nifi.ConnectionEntity, err error) {
 
-	injector, err = t.doCreateInjector(pgfe, id.Id(), toInject)
+	injector, err = t.doCreateInjector(pgfe, id, toInject)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
-	disconnected, err = t.deleteConns(out)
+	connected, err = t.connectInjector(pgfe, injector, out)
 	if err != nil {
-		return injector, nil, disconnected, err
+		return injector, connected, err
 	}
-
-	connected, err = t.connectInjector(pgfe, injector, disconnected)
-	if err != nil {
-		return injector, connected, disconnected, err
-	}
-	return injector, connected, disconnected, nil
+	return injector, connected, nil
 }
 
 func (t *testerImpl) doCreateInjector(pgfe *nifi.ProcessGroupFlowEntity,
@@ -297,22 +290,27 @@ func (t *testerImpl) doConnectInjector(pgfe *nifi.ProcessGroupFlowEntity,
 	return &conn, nil
 }
 
-func (t *testerImpl) createSink(pgfe *nifi.ProcessGroupFlowEntity,
-	in []*nifi.ConnectionEntity, id Id) (
+func (t *testerImpl) createPort(pgfe *nifi.ProcessGroupFlowEntity,
+	in []*nifi.ConnectionEntity, id string) (
 	port *nifi.PortEntity, connected, disconnected []*nifi.ConnectionEntity,
 	err error) {
 
-	port, err = t.doCreatePort(pgfe, id.Id())
+	port, err = t.doCreatePort(pgfe, id)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
-	disconnected, err = t.deleteConns(in)
-	if err != nil {
-		return port, nil, disconnected, err
+	if t.removeOutLinks {
+		disconnected, err = t.deleteConns(in)
+		if err != nil {
+			return port, nil, disconnected, err
+		}
+		connected, err = t.connectPort(pgfe, disconnected, port)
+	} else {
+		disconnected = []*nifi.ConnectionEntity{}
+		connected, err = t.connectPort(pgfe, in, port)
 	}
 
-	connected, err = t.connectPort(pgfe, disconnected, port)
 	if err != nil {
 		return port, connected, disconnected, err
 	}
@@ -393,7 +391,7 @@ func (t *testerImpl) doConnectPort(pgfe *nifi.ProcessGroupFlowEntity,
 				LoadBalanceStrategy: "DO_NOT_LOAD_BALANCE",
 				Name: "",
 				Prioritizers: []string{},
-				SelectedRelationships: []string{"success", "failure"},
+				SelectedRelationships: src.Component.SelectedRelationships,
 			},
 		})
 	err = t.handleErr(err, h, body, 201, "CreateConnection")
@@ -406,7 +404,7 @@ func (t *testerImpl) doConnectPort(pgfe *nifi.ProcessGroupFlowEntity,
 }
 
 func (t *testerImpl) startFlow(pgfe *nifi.ProcessGroupFlowEntity,
-	injectors map[Id]*nifi.ProcessorEntity, ports map[Id]*nifi.PortEntity,
+	injectors map[string]*nifi.ProcessorEntity, ports map[string]*nifi.PortEntity,
 	excluded map[string]interface{}) ([]string, error) {
 
 	started := []string{}
@@ -490,10 +488,10 @@ func (t *testerImpl) startPort(p *nifi.PortEntity) error {
 	return nil
 }
 
-func (t *testerImpl) getResults(ports map[Id]*nifi.PortEntity) (
-	map[Id]string, error) {
+func (t *testerImpl) getResults(ports map[string]*nifi.PortEntity) (
+	map[string]string, error) {
 
-	r := make(map[Id]string)
+	r := make(map[string]string)
 	for id, port := range ports {
 		d, err := t.fetchData(port)
 		if err != nil {
@@ -655,10 +653,9 @@ func readString(r io.Reader) (string, error) {
 }
 
 func (t *testerImpl) rollback(pgfe *nifi.ProcessGroupFlowEntity,
-	injectors map[Id]*nifi.ProcessorEntity,
-	injAdd, injDel map[Id][]*nifi.ConnectionEntity,
-	ports map[Id]*nifi.PortEntity,
-	sinkAdd, sinkDel map[Id][]*nifi.ConnectionEntity, err error) error {
+	injectors map[string]*nifi.ProcessorEntity,
+	injAdd map[string][]*nifi.ConnectionEntity, ports map[string]*nifi.PortEntity,
+	sinkAdd, sinkDel map[string][]*nifi.ConnectionEntity, err error) error {
 
 	for id, port := range ports {
 		e := t.rollbackPort(pgfe, port, sinkAdd[id], sinkDel[id])
@@ -668,7 +665,7 @@ func (t *testerImpl) rollback(pgfe *nifi.ProcessGroupFlowEntity,
 	}
 
 	for id, injector := range injectors {
-		e := t.rollbackNode(pgfe, injector, injAdd[id], injDel[id])
+		e := t.rollbackNode(pgfe, injector, injAdd[id])
 		if e != nil {
 			err = chainErrors(err, e)
 		}
@@ -678,14 +675,9 @@ func (t *testerImpl) rollback(pgfe *nifi.ProcessGroupFlowEntity,
 }
 
 func (t *testerImpl) rollbackNode(pgfe *nifi.ProcessGroupFlowEntity,
-	node *nifi.ProcessorEntity,
-	added, deleted []*nifi.ConnectionEntity) error {
+	node *nifi.ProcessorEntity, added []*nifi.ConnectionEntity) error {
 
 	_, err := t.deleteConns(added)
-	if err != nil {
-		return err
-	}
-	_, err = t.addConns(pgfe, deleted)
 	if err != nil {
 		return err
 	}
@@ -886,20 +878,24 @@ func (t *testerImpl) handleErr(err error, h *http.Response, body *string,
 }
 
 
-func connsOutOfId(id Id, c []nifi.ConnectionEntity) []*nifi.ConnectionEntity {
+func connsOutOfId(id string,
+	c []nifi.ConnectionEntity) []*nifi.ConnectionEntity {
+
 	conns := []*nifi.ConnectionEntity{}
 	for i, _ := range c {
-		if c[i].SourceId == id.Id() && c[i].SourceGroupId == id.GroupId() {
+		if c[i].SourceId == id {
 			conns = append(conns, &c[i])
 		}
 	}
 	return conns
 }
 
-func connsIntoId(id Id,	c []nifi.ConnectionEntity) []*nifi.ConnectionEntity {
+func connsIntoId(id string,
+	c []nifi.ConnectionEntity) []*nifi.ConnectionEntity {
+
 	conns := []*nifi.ConnectionEntity{}
 	for i, _ := range c {
-		if c[i].DestinationId == id.Id() && c[i].DestinationGroupId == id.GroupId() {
+		if c[i].DestinationId == id {
 			conns = append(conns, &c[i])
 		}
 	}
@@ -1042,18 +1038,18 @@ func cronSpec() string {
 }
 
 func excludeNodes(ids map[string]interface{},
-	toExclude map[Id]*nifi.ProcessorEntity) {
+	toExclude map[string]*nifi.ProcessorEntity) {
 
 	for id, _ := range toExclude {
-		ids[id.Id()] = nil
+		ids[id] = nil
 	}
 }
 
 func excludePorts(ids map[string]interface{},
-	toExclude map[Id]*nifi.PortEntity) {
+	toExclude map[string]*nifi.PortEntity) {
 
 	for id, _ := range toExclude {
-		ids[id.Id()] = nil
+		ids[id] = nil
 	}
 }
 
