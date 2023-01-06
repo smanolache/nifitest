@@ -10,12 +10,17 @@ import (
 
 	"time"
 	"fmt"
+	"strings"
 	"context"
+	"bytes"
 	"errors"
+	"io"
+	"encoding/binary"
 	"net/url"
 	"net/http"
 	"crypto/tls"
 	"crypto/rand"
+	"hash/crc32"
 )
 
 type testerImpl struct {
@@ -34,11 +39,11 @@ func New(cfg *Config) (Tester, error) {
 		return nil, err
 	}
 	ctx := context.TODO()
-	token, err := getToken(ctx, clnt, cfg, log)
-	if err != nil {
-		return nil, err
-	}
-	ctx = context.WithValue(ctx, nifi.ContextAccessToken, token)
+	// token, err := getToken(ctx, clnt, cfg, log)
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// ctx = context.WithValue(ctx, nifi.ContextAccessToken, token)
 	return &testerImpl{
 		log:    log,
 		ctx:    ctx,
@@ -72,7 +77,7 @@ func (t *testerImpl) Run(flowId string,
 	injectors := make(map[Id]*nifi.ProcessorEntity)
 	srcAdd := make(map[Id][]*nifi.ConnectionEntity)
 	srcDel := make(map[Id][]*nifi.ConnectionEntity)
-	sinks := make(map[Id]*nifi.ProcessorEntity)
+	ports := make(map[Id]*nifi.PortEntity)
 	sinkAdd := make(map[Id][]*nifi.ConnectionEntity)
 	sinkDel := make(map[Id][]*nifi.ConnectionEntity)
 
@@ -95,7 +100,7 @@ func (t *testerImpl) Run(flowId string,
 		}
 		if err != nil {
 			return t.rollback(&pgfe, injectors, srcAdd, srcDel,
-				sinks, sinkAdd, sinkDel, err)
+				ports, sinkAdd, sinkDel, err)
 		}
 	}
 
@@ -105,10 +110,10 @@ func (t *testerImpl) Run(flowId string,
 		// deletes all incoming connections into id
 		// creates connections from the sources of the former incoming,
 		// connections to the sink
-		sink, addConns, delConns, err :=
+		port, addConns, delConns, err :=
 			t.createSink(&pgfe, incoming, id)
-		if sink != nil {
-			sinks[id] = sink
+		if port != nil {
+			ports[id] = port
 		}
 		if addConns != nil {
 			sinkAdd[id] = addConns
@@ -118,23 +123,39 @@ func (t *testerImpl) Run(flowId string,
 		}
 		if err != nil {
 			return t.rollback(&pgfe, injectors, srcAdd, srcDel,
-				sinks, sinkAdd, sinkDel, err)
+				ports, sinkAdd, sinkDel, err)
 		}
 	}
 
 	reader := bufio.NewReader(os.Stdin)
 	reader.ReadString('\n')
 
-	err = t.startFlow(&pgfe, injectors, sinks)
+	excluded := make(map[string]interface{})
+	excludeNodes(excluded, injectors)
+	excludePorts(excluded, ports)
+	/*started*/_, err = t.startFlow(&pgfe, injectors, ports, excluded)
+	if err != nil {
+		return t.rollback(&pgfe, injectors, srcAdd, srcDel, ports,
+			sinkAdd, sinkDel, err)
+	}
 
-	return t.rollback(&pgfe, injectors, srcAdd, srcDel, sinks, sinkAdd,
+	// reader.ReadString('\n')
+
+	results, err := t.getResults(ports)
+	if err != nil {
+		return t.rollback(&pgfe, injectors, srcAdd, srcDel, ports,
+			sinkAdd, sinkDel, err)
+	}
+	for id, r := range expected {
+		actual, found := results[id]
+		if !found || actual != r {
+			t.log.Error("Output " + id.Id() + ": expected: " + r +
+				", got: " + actual)
+		}
+	}
+
+	return t.rollback(&pgfe, injectors, srcAdd, srcDel, ports, sinkAdd,
 		sinkDel, err)
-}
-
-func (t *testerImpl) startFlow(pgfe *nifi.ProcessGroupFlowEntity,
-	injectors, sinks map[Id]*nifi.ProcessorEntity) error {
-
-	return nil
 }
 
 func (t *testerImpl) createInjector(pgfe *nifi.ProcessGroupFlowEntity,
@@ -213,6 +234,7 @@ func (t *testerImpl) doCreateInjector(pgfe *nifi.ProcessGroupFlowEntity,
 		return nil, err
 	}
 
+	t.log.Debug("Created processor " + injector.Id)
 	return &injector, err
 }
 
@@ -277,109 +299,60 @@ func (t *testerImpl) doConnectInjector(pgfe *nifi.ProcessGroupFlowEntity,
 
 func (t *testerImpl) createSink(pgfe *nifi.ProcessGroupFlowEntity,
 	in []*nifi.ConnectionEntity, id Id) (
-	sink *nifi.ProcessorEntity,
-	connected, disconnected []*nifi.ConnectionEntity, err error) {
+	port *nifi.PortEntity, connected, disconnected []*nifi.ConnectionEntity,
+	err error) {
 
-	sink, err = t.doCreateSink(pgfe, id.Id())
+	port, err = t.doCreatePort(pgfe, id.Id())
 	if err != nil {
 		return nil, nil, nil, err
 	}
 
 	disconnected, err = t.deleteConns(in)
 	if err != nil {
-		return sink, nil, disconnected, err
+		return port, nil, disconnected, err
 	}
 
-	connected, err = t.connectSink(pgfe, disconnected, sink)
+	connected, err = t.connectPort(pgfe, disconnected, port)
 	if err != nil {
-		return sink, connected, disconnected, err
+		return port, connected, disconnected, err
 	}
-	return sink, connected, disconnected, nil
+	return port, connected, disconnected, nil
 }
 
-func (t *testerImpl) doCreateSink(pgfe *nifi.ProcessGroupFlowEntity,
-	id string) (*nifi.ProcessorEntity, error) {
+func (t *testerImpl) doCreatePort(pgfe *nifi.ProcessGroupFlowEntity,
+	id string) (*nifi.PortEntity, error) {
 
 	var version int64 = 0
-	sink, h, body, err := t.client.ProcessGroupsApi.CreateProcessor(
+	port, h, body, err := t.client.ProcessGroupsApi.CreateOutputPort(
 		t.ctx,
 		pgfe.ProcessGroupFlow.Id,
-		nifi.ProcessorEntity{
+		nifi.PortEntity{
 			Revision: &nifi.RevisionDto{
 				Version: &version,
 			},
 			DisconnectedNodeAcknowledged: false,
-			Component: &nifi.ProcessorDto{
-				// Bundle: nil,
-				Name:  "Sink_" + id,
-				Type_: "org.apache.nifi.processors.standard.PutFile",
-				Config: &nifi.ProcessorConfigDto{
-					AutoTerminatedRelationships: []string{
-						"success",
-						"failure",
-					},
-					BulletinLevel: "WARN",
-					ConcurrentlySchedulableTaskCount: 1,
-					ExecutionNode: "ALL",
-					PenaltyDuration: "30 sec",
-					Properties: map[string]string{
-						"Directory": "test_" + id,
-					},
-					RunDurationMillis: 0,
-					SchedulingPeriod: "1 min",
-					SchedulingStrategy: "TIMER_DRIVEN",
-					YieldDuration: "1 sec",
-				},
-			},
-		})
-	err = t.handleErr(err, h, body, 201, "CreateProcessor")
-	if err != nil {
-		return nil, err
-	}
-
-	sink, h, body, err = t.client.ProcessorsApi.UpdateProcessor(
-		t.ctx,
-		sink.Id,
-		nifi.ProcessorEntity{
-			Revision: sink.Revision,
-			DisconnectedNodeAcknowledged: false,
-			Component: &nifi.ProcessorDto{
-				Id: sink.Id,
-				Name: "Sink_" + id,
+			Component: &nifi.PortDto{
+				Name:  "Port_" + id,
+				Type_: "OUTPUT_PORT",
 				State: "STOPPED",
-				Config: &nifi.ProcessorConfigDto{
-					AutoTerminatedRelationships: []string{
-						"success",
-						"failure",
-					},
-					BulletinLevel: "WARN",
-					ConcurrentlySchedulableTaskCount: 1,
-					ExecutionNode: "ALL",
-					PenaltyDuration: "30 sec",
-					Properties: map[string]string{
-					},
-					RunDurationMillis: 0,
-					SchedulingPeriod: "1 min",
-					SchedulingStrategy: "TIMER_DRIVEN",
-					YieldDuration: "1 sec",
-				},
 			},
+			PortType: "OUTPUT_PORT",
 		})
-	err = t.handleErr(err, h, body, 200, "UpdateProcessor")
+	err = t.handleErr(err, h, body, 201, "CreateOutputPort")
 	if err != nil {
 		return nil, err
 	}
-
-	return &sink, err
+	t.log.Debug("Created port " + port.Id)
+	return &port, err
 }
 
-func (t *testerImpl) connectSink(pgfe *nifi.ProcessGroupFlowEntity,
-	disconn []*nifi.ConnectionEntity, sink *nifi.ProcessorEntity) (
+func (t *testerImpl) connectPort(pgfe *nifi.ProcessGroupFlowEntity,
+	disconn []*nifi.ConnectionEntity, port *nifi.PortEntity) (
 	[]*nifi.ConnectionEntity, error) {
 
 	conns := []*nifi.ConnectionEntity{}
 	for _, conn := range disconn {
-		c, err := t.doConnectSink(pgfe, conn, sink)
+		c, err := t.doConnectPort(pgfe, conn, port)
 		if err != nil {
 			return conns, err
 		}
@@ -388,8 +361,8 @@ func (t *testerImpl) connectSink(pgfe *nifi.ProcessGroupFlowEntity,
 	return conns, nil
 }
 
-func (t *testerImpl) doConnectSink(pgfe *nifi.ProcessGroupFlowEntity,
-	src *nifi.ConnectionEntity, dst *nifi.ProcessorEntity) (
+func (t *testerImpl) doConnectPort(pgfe *nifi.ProcessGroupFlowEntity,
+	src *nifi.ConnectionEntity, dst *nifi.PortEntity) (
 	*nifi.ConnectionEntity, error) {
 
 	var version int64 = 0
@@ -410,7 +383,7 @@ func (t *testerImpl) doConnectSink(pgfe *nifi.ProcessGroupFlowEntity,
 				Destination: &nifi.ConnectableDto{
 					GroupId: pgfe.ProcessGroupFlow.Id,
 					Id: dst.Id,
-					Type_: "PROCESSOR",
+					Type_: "OUTPUT_PORT",
 				},
 				BackPressureDataSizeThreshold: "1 GB",
 				BackPressureObjectThreshold: 10000,
@@ -432,21 +405,270 @@ func (t *testerImpl) doConnectSink(pgfe *nifi.ProcessGroupFlowEntity,
 	return &conn, nil
 }
 
-func (t *testerImpl) rollback(pgfe *nifi.ProcessGroupFlowEntity,
-	injectors map[Id]*nifi.ProcessorEntity,
-	injAdd, injDel map[Id][]*nifi.ConnectionEntity,
-	sinks map[Id]*nifi.ProcessorEntity,
-	sinkAdd, sinkDel map[Id][]*nifi.ConnectionEntity, err error) error {
+func (t *testerImpl) startFlow(pgfe *nifi.ProcessGroupFlowEntity,
+	injectors map[Id]*nifi.ProcessorEntity, ports map[Id]*nifi.PortEntity,
+	excluded map[string]interface{}) ([]string, error) {
 
-	for id, injector := range injectors {
-		e := t.rollbackNode(pgfe, injector, injAdd[id], injDel[id])
-		if e != nil {
-			err = chainErrors(err, e)
+	started := []string{}
+	for _, inj := range injectors {
+		err := t.startProc(inj)
+		if err != nil {
+			return started, err
+		}
+		started = append(started, inj.Id)
+	}
+
+	for i, _ := range pgfe.ProcessGroupFlow.Flow.Processors {
+		proc := &pgfe.ProcessGroupFlow.Flow.Processors[i]
+		if _, found := excluded[proc.Id]; !found {
+			err := t.startProc(proc)
+			if err != nil {
+				return started, err
+			}
+			started = append(started, proc.Id)
 		}
 	}
 
-	for id, sink := range sinks {
-		e := t.rollbackNode(pgfe, sink, sinkAdd[id], sinkDel[id])
+	for _, port := range ports {
+		err := t.startPort(port)
+		if err != nil {
+			return started, err
+		}
+		started = append(started, port.Id)
+	}
+
+	return started, nil
+}
+
+func (t *testerImpl) startProc(p *nifi.ProcessorEntity) error {
+	// we have to fetch it again because we may have changed its revision
+	// if we moved it on the canvas
+	node, h, body, err := t.client.ProcessorsApi.GetProcessor(t.ctx, p.Id)
+	err = t.handleErr(err, h, body, 200, "GetProcessor")
+	if err != nil {
+		return err
+	}
+
+	_, h, body, err = t.client.ProcessorsApi.UpdateRunStatus(
+		t.ctx,
+		p.Id,
+		nifi.ProcessorRunStatusEntity{
+			Revision: node.Revision,
+			DisconnectedNodeAcknowledged: false,
+			State: "RUN_ONCE",
+		})
+	err = t.handleErr(err, h, body, 200, "UpdateRunStatus")
+	if err != nil {
+		return err
+	}
+	t.log.Debug("Started processor " + p.Id)
+	return nil
+}
+
+func (t *testerImpl) startPort(p *nifi.PortEntity) error {
+	// we have to fetch it again because we may have changed its revision
+	// if we moved it on the canvas
+	port, h, body, err := t.client.OutputPortsApi.GetOutputPort(t.ctx, p.Id)
+	err = t.handleErr(err, h, body, 200, "GetOutputPort")
+	if err != nil {
+		return err
+	}
+
+	_, h, body, err = t.client.OutputPortsApi.UpdateRunStatus(
+		t.ctx,
+		p.Id,
+		nifi.PortRunStatusEntity{
+			Revision: port.Revision,
+			DisconnectedNodeAcknowledged: false,
+			State: "RUNNING",
+		})
+	err = t.handleErr(err, h, body, 200, "UpdateRunStatus")
+	if err != nil {
+		return err
+	}
+	t.log.Debug("Started port " + port.Id)
+	return nil
+}
+
+func (t *testerImpl) getResults(ports map[Id]*nifi.PortEntity) (
+	map[Id]string, error) {
+
+	r := make(map[Id]string)
+	for id, port := range ports {
+		d, err := t.fetchData(port)
+		if err != nil {
+			return r, err
+		}
+		r[id] = d
+	}
+	return r, nil
+}
+
+func (t *testerImpl) fetchData(port *nifi.PortEntity) (string, error) {
+	tid, h, body, err := t.client.DataTransferApi.CreatePortTransaction(
+		t.ctx,
+		"output-ports",
+		port.Id)
+	err = t.handleErr(err, h, body, 201, "CreatePortTransaction")
+	if err != nil {
+		return "", err
+	}
+
+	colon := strings.IndexRune(tid.Message, ':')
+	if colon == -1 {
+		return "", errors.New("Invalid message from CreatePortTransaction")
+	}
+	tx := tid.Message[colon+1:]
+
+	_, h, packet, err := t.client.DataTransferApi.TransferFlowFiles(
+		t.ctx,
+		port.Id,
+		tx)
+	err = t.handleErr(err, h, packet, 202, "TransferFlowFiles")
+	if err != nil {
+		return "", err
+	}
+
+	if packet == nil {
+		return "", errors.New("Null data when reading port")
+	}
+
+	checksum := crc32.ChecksumIEEE([]byte(*packet))
+	const CONFIRM_TRANSACTION = int32(12)
+	_, h, body, err = t.client.DataTransferApi.CommitOutputPortTransaction(
+		t.ctx,
+		CONFIRM_TRANSACTION,
+		fmt.Sprintf("%v", checksum),
+		port.Id,
+		tx)
+	err = t.handleErr(err, h, body, 200, "CommitOutputPortTransaction")
+	if err != nil {
+		return "", err
+	}
+
+	s, err := deserializePacket([]byte(*packet))
+	if err != nil {
+		return "", err
+	}
+	t.log.Debug("Port " + port.Id + ": " + s)
+	return s, err
+}
+
+/*
+   00000003
+   00000004 70617468
+   00000002 2e2f
+   
+   00000008 66696c656e616d65
+   00000024 33663538396637372d323534342d343734362d623637382d373562396339663335333463
+   
+   00000004 75756964
+   00000024 33663538396637372d323534342d343734362d623637382d373562396339663335333463
+
+   0000000000000003 313233
+ */
+func deserializePacket(packet []byte) (string, error) {
+	r := bytes.NewReader(packet)
+	if r == nil {
+		return "", errors.New("Could not get a byte reader")
+	}
+
+	var N int32
+	err := binary.Read(r, binary.BigEndian, &N)
+	if err != nil {
+		return "", chainErrors(
+			errors.New("Could not read the number of attributes"),
+			err)
+	}
+	for i := 0; i < int(N); i++ {
+		_, _, err := readKV(r)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	var S int64
+	err = binary.Read(r, binary.BigEndian, &S)
+	if err != nil {
+		return "", chainErrors(
+			errors.New("Could not read the data size"), err)
+	}
+
+	d := []byte{}
+	var read int64 = 0
+	for {
+		buf := make([]byte, S - read)
+		size, err := r.Read(buf)
+		read += int64(size)
+		if err != nil {
+			if err != io.EOF {
+				return "", chainErrors(
+					errors.New("Reading data"), err)
+			}
+			if read < S {
+				return "", errors.New("Premature EOF")
+			}
+			d = append(d, buf[0:size]...)
+			break
+		}
+		d = append(d, buf[0:size]...)
+		if read == S {
+			size, err = r.Read(buf)
+			if err == nil || err != io.EOF || size > 0 {
+				return "", errors.New("Trailing garbage")
+			}
+			break
+		}
+	}
+
+	return string(d), nil
+}
+
+func readKV(r io.Reader) (string, string, error) {
+	k, err := readString(r)
+	if err != nil {
+		return "", "", err
+	}
+	v, err := readString(r)
+	if err != nil {
+		return k, "", err
+	}
+	return k, v, nil
+}
+
+func readString(r io.Reader) (string, error) {
+	var S int32
+	err := binary.Read(r, binary.BigEndian, &S)
+	if err != nil {
+		return "", chainErrors(
+			errors.New("Could not read the string length"),	err)
+	}
+	b := make([]byte, S)
+	n, err := r.Read(b)
+	if n < int(S) {
+		return string(b), errors.New("Incomplete string")
+	}
+	if err != nil && err != io.EOF {
+		return string(b), err
+	}
+	return string(b), nil
+}
+
+func (t *testerImpl) rollback(pgfe *nifi.ProcessGroupFlowEntity,
+	injectors map[Id]*nifi.ProcessorEntity,
+	injAdd, injDel map[Id][]*nifi.ConnectionEntity,
+	ports map[Id]*nifi.PortEntity,
+	sinkAdd, sinkDel map[Id][]*nifi.ConnectionEntity, err error) error {
+
+	for id, port := range ports {
+		e := t.rollbackPort(pgfe, port, sinkAdd[id], sinkDel[id])
+		if e != nil {
+			return chainErrors(err, e)
+		}
+	}
+
+	for id, injector := range injectors {
+		e := t.rollbackNode(pgfe, injector, injAdd[id], injDel[id])
 		if e != nil {
 			err = chainErrors(err, e)
 		}
@@ -496,9 +718,81 @@ func (t *testerImpl) deleteProc(p *nifi.ProcessorEntity) (
 	if err != nil {
 		return nil, err
 	}
-	t.log.Debug("Deleted " + proc.Id)
+	t.log.Debug("Deleted processor " + proc.Id)
 
 	return &proc, nil
+}
+
+func (t *testerImpl) rollbackPort(pgfe *nifi.ProcessGroupFlowEntity,
+	p *nifi.PortEntity, added, deleted []*nifi.ConnectionEntity) error {
+
+	port, err := t.stopPort(p)
+	if err != nil {
+		return err
+	}
+
+	_, err = t.deleteConns(added)
+	if err != nil {
+		return err
+	}
+	_, err = t.addConns(pgfe, deleted)
+	if err != nil {
+		return err
+	}
+	_, err = t.deletePort(port)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (t *testerImpl) stopPort(p *nifi.PortEntity) (*nifi.PortEntity, error) {
+	// we have to fetch it again because we may have changed its revision
+	// if we moved it on the canvas
+	port, h, body, err := t.client.OutputPortsApi.GetOutputPort(t.ctx, p.Id)
+	err = t.handleErr(err, h, body, 200, "GetOutputPort")
+	if err != nil {
+		return nil, err
+	}
+
+	_, h, body, err = t.client.OutputPortsApi.UpdateRunStatus(
+		t.ctx,
+		port.Id,
+		nifi.PortRunStatusEntity{
+			Revision: port.Revision,
+			DisconnectedNodeAcknowledged: false,
+			State: "STOPPED",
+		})
+	err = t.handleErr(err, h, body, 200, "UpdateRunStatus")
+	if err != nil {
+		return nil, err
+	}
+	t.log.Debug("Stopped port " + port.Id)
+	return &port, nil
+}
+
+func (t *testerImpl) deletePort(p *nifi.PortEntity) (*nifi.PortEntity, error) {
+	// we have to fetch it again because we may have changed its revision
+	// if we moved it on the canvas
+	prt, h, body, err := t.client.OutputPortsApi.GetOutputPort(t.ctx, p.Id)
+	err = t.handleErr(err, h, body, 200, "GetOutputPort")
+	if err != nil {
+		return nil, err
+	}
+	version := optional.NewString(fmt.Sprintf("%v", *prt.Revision.Version))
+	port, h, body, err := t.client.OutputPortsApi.RemoveOutputPort(
+		t.ctx,
+		p.Id,
+		&nifi.OutputPortsApiRemoveOutputPortOpts{
+			Version: version,
+		},
+	)
+	err = t.handleErr(err, h, body, 200, "RemoveOutputPort")
+	if err != nil {
+		return nil, err
+	}
+	t.log.Debug("Deleted port " + port.Id)
+	return &port, err
 }
 
 func (t *testerImpl) addConns(pgfe *nifi.ProcessGroupFlowEntity,
@@ -623,11 +917,13 @@ func getClient(urlString string, proxyURL string, verifySrvCert bool) (
 	if err != nil {
 		return nil, err
 	}
+	dfltHdrs := make(map[string]string)
+	dfltHdrs["x-nifi-site-to-site-protocol-version"] = "3";
 	cfg := &nifi.Configuration{
 		BasePath:      urlString,
 		Host:          url.Host,
 		Scheme:        url.Scheme,
-		DefaultHeader: make(map[string]string),
+		DefaultHeader: dfltHdrs,
 		UserAgent:     "NifiKop",
 		HTTPClient:    client,
 	}
@@ -652,13 +948,10 @@ func getTransport(scheme string, proxyURL string, verifySrvCert bool) (
 		return nil, err
 	}
 	tls := getTLS(scheme, verifySrvCert)
-	if pxy != nil || tls != nil {
-		return &http.Transport{
-			Proxy:           pxy,
-			TLSClientConfig: tls,
-		}, nil
-	}
-	return nil, nil
+	return &http.Transport{
+		Proxy:           pxy,
+		TLSClientConfig: tls,
+	}, nil
 }
 
 func getProxy(proxyURL string) (func (*http.Request) (*url.URL, error), error) {
@@ -693,7 +986,13 @@ func getToken(ctx context.Context, client *nifi.APIClient, cfg *Config,
 				Password: cfg.Password,
 			})
 		if err != nil {
-			return "", err
+			var msg string
+			if token != nil {
+				msg = *token
+			} else {
+				msg = "null token"
+			}
+			return "", chainErrors(err, errors.New(msg))
 		}
 		if h.StatusCode != 201 {
 			if token != nil {
@@ -741,3 +1040,20 @@ func cronSpec() string {
 	return fmt.Sprintf("%v\t%v\t%v\t%v\t*\t?", t.Minute(), t.Hour(),
 		t.Day(), int(t.Month()))
 }
+
+func excludeNodes(ids map[string]interface{},
+	toExclude map[Id]*nifi.ProcessorEntity) {
+
+	for id, _ := range toExclude {
+		ids[id.Id()] = nil
+	}
+}
+
+func excludePorts(ids map[string]interface{},
+	toExclude map[Id]*nifi.PortEntity) {
+
+	for id, _ := range toExclude {
+		ids[id.Id()] = nil
+	}
+}
+
