@@ -5,7 +5,20 @@ type errorChain struct {
 	err  error
 }
 
-func chainErrors(e1, e2 error) error {
+func chainErrors(e ...error) error {
+	if len(e) == 0 {
+		return nil
+	}
+	if len(e) == 1 {
+		return e[0]
+	}
+	errs := make([]error, len(e) - 1)
+	errs[0] = chainTwoErrors(e[0], e[1])
+	copy(errs[1:], e[2:])
+	return chainErrors(errs...)
+}
+
+func chainTwoErrors(e1, e2 error) error {
 	if e1 != nil {
 		if e2 != nil {
 			ec, ok := e1.(*errorChain)
@@ -26,7 +39,12 @@ func (e *errorChain) chain(e2 error) error {
 	if e.next != nil {
 		e.next.chain(e2)
 	} else {
-		e.next = &errorChain{next: nil, err: e2}
+		ec, ok := e2.(*errorChain)
+		if ok {
+			e.next = ec
+		} else {
+			e.next = &errorChain{next: nil, err: e2}
+		}
 	}
 	return e
 }

@@ -27,7 +27,7 @@ func main() {
 		VerifyServerCertificate: false,
 		Username:                user,
 		Password:                pass,
-		RemoveOutLinks:          false,
+		RemoveOutLinks:          true,
 	}
 	c, err := nifitest.New(&cfg)
 	if err != nil {
@@ -43,9 +43,52 @@ func main() {
 	expected := make(map[string]string)
 	dst := "322b9410-0185-1000-fdc6-192740b4fd9c"
 	expected[dst] = string(exp)
-	err = c.Run("root", testData, expected)
+
+	err = doMain(c, testData, expected)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 		os.Exit(1)
 	}
+	err = doMain(c, testData, expected)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+
+	result, err := c.TestSync(testData, expected)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	if result {
+		fmt.Fprintf(os.Stdout, "Test has passed\n")
+	} else {
+		fmt.Fprintf(os.Stdout, "Test has failed\n")
+	}
 }
+
+func doMain(c nifitest.Tester, testData, expected map[string]string) error {
+	// setup and start executing
+	rlt, err := c.TestAsync(testData, expected)
+	for err == nil && !rlt.IsSet() {
+		rlt, err = c.Check()
+	}
+	// err != nil || err == nil && rlt.IsSet()
+	if err != nil {
+		rollbackError := c.Rollback()
+		if rollbackError != nil {
+			return fmt.Errorf("%v and %v", err, rollbackError)
+		}
+		return err
+	}
+
+	// err == nil && rlt.IsSet()
+	// print the result
+	if rlt.Value() {
+		fmt.Fprintf(os.Stdout, "Test has passed\n")
+	} else {
+		fmt.Fprintf(os.Stdout, "Test has failed\n")
+	}
+	return nil
+}
+
