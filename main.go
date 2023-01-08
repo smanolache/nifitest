@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 	"fmt"
-	"orange.com/nifitest/nifitest"
+	"github.com/smanolache/nifitest/nifitest"
 	"github.com/antihax/optional"
 )
 

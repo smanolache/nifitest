@@ -1,4 +1,4 @@
-module orange.com/nifitest
+module github.com/smanolache/nifitest
 
 go 1.19
 
